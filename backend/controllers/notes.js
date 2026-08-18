@@ -1,5 +1,12 @@
+const fs = require("fs");
 const Note = require("../models/Note");
 const logger = require("../config/logger");
+const { parseImportFile } = require("../utils/noteFileParser");
+const { buildExportFile, SUPPORTED_FORMATS } = require("../utils/noteFileExporter");
+
+const MAX_IMPORT_NOTES = 500;
+const MAX_TITLE_LENGTH = 200;
+const MAX_CONTENT_LENGTH = 20000;
 
 const getNotes = async (req, res) => {
   try {
@@ -103,13 +110,7 @@ const updateNote = async (req, res) => {
 
 const togglePin = async (req, res) => {
   try {
-    // Exclude trashed notes so a stale pin request can't bypass the
-    // unpin-on-trash behavior enforced in trashNote().
-    const note = await Note.findOne({
-      _id: req.params.id,
-      owner: req.user.id,
-      trashed: false,
-    });
+    const note = await Note.findOne({ _id: req.params.id, owner: req.user.id });
 
     if (!note) {
       return res.status(404).json({ message: "Note not found" });
@@ -201,6 +202,145 @@ const permanentlyDeleteNote = async (req, res) => {
   }
 };
 
+const exportNotes = async (req, res) => {
+  const format = (req.query.format || "csv").toLowerCase();
+
+  if (!SUPPORTED_FORMATS.includes(format)) {
+    return res.status(400).json({
+      message: `Unsupported format. Choose one of: ${SUPPORTED_FORMATS.join(", ")}`,
+    });
+  }
+
+  let filePath;
+
+  try {
+    const notes = await Note.find({ owner: req.user.id, trashed: false })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    if (notes.length === 0) {
+      return res.status(404).json({ message: "You have no notes to export" });
+    }
+
+    const built = buildExportFile(notes, format);
+    filePath = built.filePath;
+
+    logger.info(
+      { userId: req.user.id, noteCount: notes.length, format },
+      "Notes exported"
+    );
+
+    res.download(filePath, built.filename, (err) => {
+      // Clean up the temp file from disk regardless of whether the
+      // download succeeded or the client disconnected mid-stream.
+      fs.unlink(filePath, (unlinkErr) => {
+        if (unlinkErr) {
+          logger.error({ err: unlinkErr }, "Failed to clean up export temp file");
+        }
+      });
+
+      if (err) {
+        logger.error({ err }, "Error sending export file");
+      }
+    });
+  } catch (error) {
+    if (filePath) {
+      fs.unlink(filePath, () => {});
+    }
+    logger.error({ err: error }, "ExportNotes error");
+    res.status(500).json({ message: "Server error exporting notes" });
+  }
+};
+
+const importNotes = async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: "Please upload a .csv, .txt, or .xlsx file" });
+  }
+
+  const uploadedPath = req.file.path;
+
+  try {
+    let rawNotes;
+    try {
+      rawNotes = parseImportFile(uploadedPath);
+    } catch (parseError) {
+      logger.warn({ err: parseError }, "ImportNotes parse error");
+      return res.status(400).json({ message: "Could not parse the uploaded file" });
+    }
+
+    if (!Array.isArray(rawNotes) || rawNotes.length === 0) {
+      return res.status(400).json({ message: "No notes found in the uploaded file" });
+    }
+
+    if (rawNotes.length > MAX_IMPORT_NOTES) {
+      return res.status(400).json({
+        message: `Cannot import more than ${MAX_IMPORT_NOTES} notes at once`,
+      });
+    }
+
+    const validNotes = [];
+    const skipped = [];
+
+    rawNotes.forEach((raw, index) => {
+      const title = typeof raw?.title === "string" ? raw.title.trim() : "";
+      const content = typeof raw?.content === "string" ? raw.content.trim() : "";
+
+      if (!title) {
+        skipped.push({ index, reason: "Missing or empty title" });
+        return;
+      }
+
+      if (title.length > MAX_TITLE_LENGTH) {
+        skipped.push({ index, reason: "Title too long" });
+        return;
+      }
+
+      if (content.length > MAX_CONTENT_LENGTH) {
+        skipped.push({ index, reason: "Content too long" });
+        return;
+      }
+
+      validNotes.push({
+        title,
+        content,
+        owner: req.user.id,
+        pinned: false,
+      });
+    });
+
+    if (validNotes.length === 0) {
+      return res.status(400).json({
+        message: "No valid notes to import",
+        skipped,
+      });
+    }
+
+    const created = await Note.insertMany(validNotes, { ordered: false });
+
+    logger.info(
+      { userId: req.user.id, imported: created.length, skipped: skipped.length },
+      "Notes imported"
+    );
+
+    res.status(201).json({
+      message: `Imported ${created.length} note(s)`,
+      imported: created.length,
+      skippedCount: skipped.length,
+      skipped,
+      notes: created,
+    });
+  } catch (error) {
+    logger.error({ err: error }, "ImportNotes error");
+    res.status(500).json({ message: "Server error importing notes" });
+  } finally {
+    fs.unlink(uploadedPath, (unlinkErr) => {
+      if (unlinkErr) {
+        logger.error({ err: unlinkErr }, "Failed to clean up uploaded temp file");
+      }
+    });
+  }
+};
+
 module.exports = {
   getNotes,
   getTrashedNotes,
@@ -211,4 +351,6 @@ module.exports = {
   trashNote,
   restoreNote,
   permanentlyDeleteNote,
+  exportNotes,
+  importNotes,
 };
